@@ -1,0 +1,10 @@
+# build artifacts
+*.exe
+*.o
+*.obj
+*.bin
+!tests/*.c
+libdynalib/tests/stub5.bin
+libdynalib/tests/gcc_stub.bin
+# dll outputs are built per-host
+*.dll
