@@ -63,7 +63,7 @@ the stripped `tier-core` build does not, so plugins cannot load there).
 
 Verified by measurement on this host (Windows x64, gcc 15.1 / WinLibs):
 
-- 86/86 assertions pass in the library harness.
+- 107/107 assertions pass in the library harness.
 - Stack arguments work: 5, 7, 8 and 12 argument calls return the right
   values, and the slot order is preserved (`mix7(1..7) == 1234567`).
 - 64-bit returns arrive in JavaScript as `BigInt` (`u64` → BigInt,

@@ -17,10 +17,10 @@ Sunat collector cannot move them out from under a running C loop.
 | `dynalib.h` | 271 | public C API |
 | `dynalib.c` | 669 | load/resolve, PE + ELF export parsers, anti-ASLR base, `exports()` |
 | `dynalib_abi.c` | 340 | calling-convention grammar, slot order, pinning, reverse callbacks |
-| `dynalib_trampoline.c` | 394 | x86_64 / AArch64 JIT stub emitters on W^X pages |
+| `dynalib_trampoline.c` | 512 | x86_64 / AArch64 JIT stub emitters on W^X pages |
 | `dynalib_internal.h` | 37 | interface between the four parts above |
-| `tests/dynalib_test.c` | 529 | T1–T11 harness |
-| `tests/dbtest.c` | 37 | throwaway DLL fixture with args, a return value and a native caller |
+| `tests/dynalib_test.c` | 700 | T1–T12 harness |
+| `tests/dbtest.c` | 112 | throwaway DLL fixture: integer, 64-bit and float targets |
 | `tests/dbg.c`, `stub_dump.c`, `crash_locate.c` | 262 | diagnostic tools |
 
 ## Build and test
@@ -32,7 +32,29 @@ bash build.sh
 needs a native-PE gcc (on this host: WinLibs MCF with `gcc -shared`). Point at
 a different SQLite build with `SQLITE_DLL=/path/sqlite3.dll bash build.sh`.
 
-Current state on this host: **60 passed, 0 failed.**
+Current state on this host: **107 passed, 0 failed.**
+
+## The call-stub contract (read this before calling a stub)
+
+The emitted stub has ONE native signature:
+
+```c
+uint64_t stub(const uint64_t args[16]);   /* integer / pointer / void return */
+double   stub(const uint64_t args[16]);   /* f32 / f64 return               */
+```
+
+The caller fills a flat 16-slot `uint64_t` array — integers as raw values,
+floats bit-cast with `memcpy` — and the stub classifies every slot:
+
+| convention | integer slots | float slots | overflow |
+| --- | --- | --- | --- |
+| MS64 | **positional**: slot k → `rcx/rdx/r8/r9` | positional: slot k → `xmm0..xmm3` | slots ≥ 4 → stack, after a 32-byte shadow space |
+| SysV | class-counted: `rdi,rsi,rdx,rcx,r8,r9` | class-counted: `xmm0..xmm7` | past the budget → stack |
+
+MS64 is *positional*: an integer at slot 1 goes to `rdx`, never to "the next
+free integer register". SysV is *class-counted*: the two budgets advance
+independently, so `f64(i32, f64, i32, f64, f64)` puts the integers in
+`rdi/rsi/rdx` and the doubles in `xmm0/xmm1/xmm2`.
 
 ## What the tests actually exercise
 
@@ -49,6 +71,13 @@ Current state on this host: **60 passed, 0 failed.**
 - **T5/T6** — call stubs emitted onto a W^X page: `stub(3,4) == 7`,
   `stub(41,1) == 42`, `stub(-5,5) == 0`; plus a zero-argument stub returning a
   string pointer.
+- **T10 (stack)** — 5, 7, 8 and 12 arguments: the right values, the slot
+  order preserved (`mix7(1..7) == 1234567`).
+- **T11 (64-bit)** — `u64`/`i64` returns and arguments.
+- **T12 (float)** — `fadd(2.5, 4.25) == 6.75`, `fmul3(2,3,4) == 24`,
+  mixed classes `fmix5 == 1239`, `fsum9(1..9) == 45` (the ninth double
+  spills off the xmm budget onto the stack), an `f32` return widened to
+  `3.5`, and `fscale(1.5, 4) == 6` (double first, integer second).
 - **T7** — the reverse path: C calling back through a callback stub into the
   engine-installed dispatcher, with the slot id, `argc`, and both argument
   values arriving correctly.
@@ -81,6 +110,14 @@ Current state on this host: **60 passed, 0 failed.**
 - The x86_64 emitters use `mov rbp,rsp` and restore the frame from it; the
   epilogue displacement is sensitive to whether that store exists, so the two
   must change together.
+- Two encoding facts were measured on this host, not guessed:
+  - `[rsp+disp32]` needs a **SIB byte `0x24`** — without it the CPU reads
+    the displacement as a SIB and the store lands on a garbage address.
+  - loading a 64-bit value into an xmm register from memory is
+    **`F3 REX.W 0F 7E /r`**. `F3 0F 6E` is `MOVQ xmm,xmm` (register source
+    only) and raises `#UD` (0xC000001D) with a memory operand.
+- Struct-by-value arguments and returns are rejected at parse time; there is
+  no class-based layout for them yet.
 
 ## Files worth knowing
 

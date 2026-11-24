@@ -386,23 +386,30 @@ static MBJSValue dl_symbol_abi(MBJSContext *ctx, MBJSValueConst this_val,
  * callSymbol(id, argc, a0, a1, ...) — invoke the resolved symbol through the
  * JIT trampoline.
  *
+ * The trampoline is buffer-based: the bridge fills a flat 16-slot
+ * uint64_t array (floats are bit-cast into their slot) and calls the
+ * stub with that pointer, so the stub can classify every slot into the
+ * right register class (GP / xmm / stack) for the target convention.
+ *
  * Argument marshalling:
  *   - i64/u64 parameters accept a JS BigInt (full 64-bit) or a Number
  *     (precision above 2^53 is lost, and the bridge says so in the docs);
- *   - every other parameter takes a Number, or a BigInt that is truncated
- *     to 64 bits;
- *   - floating-point parameters are REJECTED: the trampoline emitter only
- *     shuffles general-purpose registers, so an SSE argument would be
- *     silently wrong.
+ *   - every other integer parameter takes a Number, or a BigInt that is
+ *     truncated to 64 bits;
+ *   - f32/f64 parameters take a Number and are bit-cast into the slot.
  *
  * Return marshalling:
- *   - u64 -> BigInt, i64 -> BigInt, void -> undefined, everything else -> Number.
+ *   - u64 -> BigInt, i64 -> BigInt, void -> undefined,
+ *   - f32/f64 -> Number (the stub widens an f32 return for us),
+ *   - everything else -> Number.
  */
 #define DL_CALL_MAX 12
+#define DL_ARG_SLOTS 16
 
-typedef uint64_t (*dl_call_t)(uint64_t, uint64_t, uint64_t, uint64_t,
-                              uint64_t, uint64_t, uint64_t, uint64_t,
-                              uint64_t, uint64_t, uint64_t, uint64_t);
+/* the emitted stub takes a flat argument buffer; float-returning
+ * contracts are read through the double-returning twin               */
+typedef uint64_t (*dl_call_t)(const uint64_t *args);
+typedef double   (*dl_call_f)(const uint64_t *args);
 
 /* how many register argument slots the platform convention has */
 static int dl_reg_slots(DynalibAbiKind kind)
@@ -421,6 +428,20 @@ static int dl_marshal_arg(MBJSContext *ctx, MBJSValueConst v, uint8_t type,
     int64_t si = 0;
     uint64_t ui = 0;
     double d = 0;
+
+    if (type == DYNALIB_T_F32 || type == DYNALIB_T_F64) {
+        /* bit-cast into the slot: the stub loads it into an xmm register
+         * with MOVQ (low 32 bits carry an f32, all 64 carry an f64)    */
+        if (rt.ToFloat64(ctx, &d, v) < 0)
+            return -1;
+        if (type == DYNALIB_T_F32) {
+            float f = (float)d;
+            memcpy(out, &f, sizeof f);
+        } else {
+            memcpy(out, &d, sizeof d);
+        }
+        return 0;
+    }
 
     if (type == DYNALIB_T_I64 || type == DYNALIB_T_U64) {
         if (MBJS_IsBigInt(v)) {
@@ -473,7 +494,7 @@ static MBJSValue dl_call_symbol(MBJSContext *ctx, MBJSValueConst this_val,
 {
     long id = -1, n = 0, i;
     SymSlot *s;
-    uint64_t a[DL_CALL_MAX];
+    uint64_t a[DL_ARG_SLOTS];
     uint64_t r;
 
     (void)this_val;
@@ -503,18 +524,6 @@ static MBJSValue dl_call_symbol(MBJSContext *ctx, MBJSValueConst this_val,
         return MBJS_NewFloat64(ctx, 0.0);
     }
 
-    /* float parameters and float returns are not supported by the emitter */
-    for (i = 0; i < (long)s->abi.arg_count && i < 16; i++) {
-        uint8_t t = s->abi.arg_types[i];
-        if (t == DYNALIB_T_F32 || t == DYNALIB_T_F64) {
-            set_error("floating-point arguments are not supported yet");
-            return MBJS_NewFloat64(ctx, 0.0);
-        }
-    }
-    if (s->abi.ret_type == DYNALIB_T_F32 || s->abi.ret_type == DYNALIB_T_F64) {
-        set_error("floating-point returns are not supported yet");
-        return MBJS_NewFloat64(ctx, 0.0);
-    }
     if (s->abi.ret_type == DYNALIB_T_STRUCT_VAL) {
         set_error("struct-by-value returns are not supported yet");
         return MBJS_NewFloat64(ctx, 0.0);
@@ -537,8 +546,13 @@ static MBJSValue dl_call_symbol(MBJSContext *ctx, MBJSValueConst this_val,
         return MBJS_NewFloat64(ctx, 0.0);
     }
 
-    r = ((dl_call_t)s->stub)(a[0], a[1], a[2], a[3], a[4], a[5],
-                             a[6], a[7], a[8], a[9], a[10], a[11]);
+    if (s->has_abi &&
+        (s->abi.ret_type == DYNALIB_T_F32 || s->abi.ret_type == DYNALIB_T_F64)) {
+        /* the stub returns through xmm0; the double twin reads it back */
+        double d = ((dl_call_f)s->stub)(a);
+        return MBJS_NewFloat64(ctx, d);
+    }
+    r = ((dl_call_t)s->stub)(a);
     if (!s->has_abi) {
         /* no type contract: hand back the raw 64-bit result as a Number */
         return MBJS_NewFloat64(ctx, (double)r);

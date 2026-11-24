@@ -61,6 +61,40 @@ EXPL uint64_t dbtest_sumu64(uint64_t a, uint64_t b, uint64_t c,
     return a + b + c + d + e;
 }
 
+/* --- floating-point targets ---------------------------------------- */
+/* The float path is class-based: doubles travel in xmm registers (and on
+ * the stack once the xmm budget runs out), integers in the GP registers,
+ * and the two budgets are counted independently. These targets make a
+ * mis-classified slot visible as a wrong number.                     */
+
+EXPL double dbtest_fadd(double a, double b) { return a + b; }
+
+EXPL double dbtest_fmul3(double a, double b, double c)
+{
+    return a * b * c;
+}
+
+/* mixed classes: int, double, int, double, double */
+EXPL double dbtest_fmix5(int a, double b, int c, double d, double e)
+{
+    return a * 1000.0 + b * 100.0 + c * 10.0 + d + e;
+}
+
+/* 9 doubles: the first eight ride xmm0..xmm7, the ninth spills to the
+ * stack area — this is what catches a broken SysV xmm overflow path.   */
+EXPL double dbtest_fsum9(double a, double b, double c, double d, double e,
+                          double f, double g, double h, double i)
+{
+    return a + b + c + d + e + f + g + h + i;
+}
+
+/* a single-precision return: the stub has to widen it for a caller that
+ * reads xmm0 as a double                                                */
+EXPL float dbtest_fhalf(float v) { return v / 2.0f; }
+
+/* double return with an integer argument in the middle */
+EXPL double dbtest_fscale(double v, int n) { return v * n; }
+
 EXPL void dbtest_invoke_cb0(cb0_t cb) { if (cb) cb(); }
 
 EXPL void dbtest_invoke_cb2(int a, int b, cb2_t cb)

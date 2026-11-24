@@ -191,6 +191,17 @@ static void t_pe_and_sqlite(void)
     dynalib_close(m);
 }
 
+/* ------------------------------------------------------------------ */
+/* buffer-call helpers: the emitted stub reads its arguments from a
+ * flat 16-slot uint64_t array (floats are bit-cast into their slot)  */
+
+typedef uint64_t (*dl_stub_i)(const uint64_t *args);
+typedef double   (*dl_stub_f)(const uint64_t *args);
+
+static void buf_i(uint64_t *b, int i, int64_t v) { b[i] = (uint64_t)v; }
+static void buf_d(uint64_t *b, int i, double v)  { memcpy(b + i, &v, 8); }
+static void buf_f(uint64_t *b, int i, float v)   { memcpy(b + i, &v, 4); }
+
 /* ================================================================== */
 /* T5-T7: call stubs and the callback round-trip                       */
 /* ================================================================== */
@@ -228,17 +239,26 @@ static void t_trampolines(const char *dll_name)
         dynalib_symbol_free(s);
     }
 
-    dynalib_abi_parse("ms_abi", &ms);
+    dynalib_abi_parse("ms_abi i32(i32, i32)", &ms);
     ok("abi parse ms_abi", ms.kind == DYNALIB_ABI_MS64, "kind=ms64");
+    ok("ms_abi contract keeps its type list", ms.arg_count == 2, "args=2");
 
     s = dynalib_resolve(m, 0, "dbtest_add", NULL, NULL);
     if (s) {
         stub = dynalib_trampoline_emit(s->fn_ptr, &ms, NULL);
         ok("call stub emitted on a W^X page", stub != NULL, "yes");
         if (stub) {
-            ok("stub(3,4) == 7",   ((int (*)(int, int))stub)(3, 4) == 7,  "yes");
-            ok("stub(41,1) == 42", ((int (*)(int, int))stub)(41, 1) == 42, "yes");
-            ok("stub(-5,5) == 0",  ((int (*)(int, int))stub)(-5, 5) == 0,  "yes");
+            uint64_t b[16] = {0};
+            int r;
+            buf_i(b, 0, 3); buf_i(b, 1, 4);
+            r = (int)((dl_stub_i)stub)(b);
+            ok("stub(3,4) == 7",   r == 7,  "yes");
+            buf_i(b, 0, 41); buf_i(b, 1, 1);
+            r = (int)((dl_stub_i)stub)(b);
+            ok("stub(41,1) == 42", r == 42, "yes");
+            buf_i(b, 0, -5); buf_i(b, 1, 5);
+            r = (int)((dl_stub_i)stub)(b);
+            ok("stub(-5,5) == 0",  r == 0,  "yes");
             dynalib_trampoline_free(stub, NULL);
         }
         dynalib_symbol_free(s);
@@ -254,7 +274,8 @@ static void t_trampolines(const char *dll_name)
         stub = dynalib_trampoline_emit(s->fn_ptr, &none, NULL);
         ok("stub emitted", stub != NULL, "yes");
         if (stub) {
-            const char *greet = ((const char *(*)(void))stub)();
+            uint64_t b[16] = {0};
+            const char *greet = (const char *)((dl_stub_i)stub)(b);
             ok("stub() returns the greeting",
                greet && !strcmp(greet, "greetings from dbtest"), greet ? greet : "");
             dynalib_trampoline_free(stub, NULL);
@@ -322,10 +343,13 @@ static void t_stack_args(void)
     s = dynalib_resolve(m, 0, "dbtest_sum5", NULL, NULL);
     ok("dbtest_sum5 resolved", s != NULL, "yes");
     if (s) {
+        int r;
         stub = dynalib_trampoline_emit(s->fn_ptr, &abi, NULL);
         ok("stub emitted for 5 args", stub != NULL, "yes");
         if (stub) {
-            int r = ((int (*)(int, int, int, int, int))stub)(1, 2, 3, 4, 5);
+            uint64_t b[16] = {0}; int j;
+            for (j = 0; j < 5; j++) buf_i(b, j, j + 1);
+            r = (int)((dl_stub_i)stub)(b);
             snprintf(detail, sizeof detail, "got %d", r);
             ok("stub(1,2,3,4,5) == 15", r == 15, detail);
             dynalib_trampoline_free(stub, NULL);
@@ -339,11 +363,13 @@ static void t_stack_args(void)
     s = dynalib_resolve(m, 0, "dbtest_sum8", NULL, NULL);
     ok("dbtest_sum8 resolved", s != NULL, "yes");
     if (s) {
+        int r;
         stub = dynalib_trampoline_emit(s->fn_ptr, &abi, NULL);
         ok("stub emitted for 8 args", stub != NULL, "yes");
         if (stub) {
-            int r = ((int (*)(int, int, int, int, int, int, int, int))stub)
-                        (1, 2, 3, 4, 5, 6, 7, 8);
+            uint64_t b[16] = {0}; int j;
+            for (j = 0; j < 8; j++) buf_i(b, j, j + 1);
+            r = (int)((dl_stub_i)stub)(b);
             snprintf(detail, sizeof detail, "got %d", r);
             ok("stub(1..8) == 36", r == 36, detail);
             dynalib_trampoline_free(stub, NULL);
@@ -357,12 +383,13 @@ static void t_stack_args(void)
     s = dynalib_resolve(m, 0, "dbtest_sum12", NULL, NULL);
     ok("dbtest_sum12 resolved", s != NULL, "yes");
     if (s) {
+        int r;
         stub = dynalib_trampoline_emit(s->fn_ptr, &abi, NULL);
         ok("stub emitted for 12 args", stub != NULL, "yes");
         if (stub) {
-            int r = ((int (*)(int, int, int, int, int, int,
-                              int, int, int, int, int, int))stub)
-                        (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+            uint64_t b[16] = {0}; int j;
+            for (j = 0; j < 12; j++) buf_i(b, j, j + 1);
+            r = (int)((dl_stub_i)stub)(b);
             snprintf(detail, sizeof detail, "got %d", r);
             ok("stub(1..12) == 78", r == 78, detail);
             dynalib_trampoline_free(stub, NULL);
@@ -375,11 +402,13 @@ static void t_stack_args(void)
     s = dynalib_resolve(m, 0, "dbtest_mix7", NULL, NULL);
     ok("dbtest_mix7 resolved", s != NULL, "yes");
     if (s) {
+        int r;
         stub = dynalib_trampoline_emit(s->fn_ptr, &abi, NULL);
         ok("stub emitted for 7 args", stub != NULL, "yes");
         if (stub) {
-            int r = ((int (*)(int, int, int, int, int, int, int))stub)
-                        (1, 2, 3, 4, 5, 6, 7);
+            uint64_t b[16] = {0}; int j;
+            for (j = 0; j < 7; j++) buf_i(b, j, j + 1);
+            r = (int)((dl_stub_i)stub)(b);
             snprintf(detail, sizeof detail, "got %d (want 1234567)", r);
             ok("stub(1..7) keeps slot order", r == 1234567, detail);
             dynalib_trampoline_free(stub, NULL);
@@ -417,7 +446,9 @@ static void t_wide_returns(void)
         stub = dynalib_trampoline_emit(s->fn_ptr, &abi, NULL);
         ok("stub emitted", stub != NULL, "yes");
         if (stub) {
-            uint64_t r = ((uint64_t (*)(uint64_t))stub)(5);
+            uint64_t b[16] = {0}, r;
+            buf_i(b, 0, 5);
+            r = ((dl_stub_i)stub)(b);
             snprintf(detail, sizeof detail, "got 0x%llx",
                      (unsigned long long)r);
             ok("stub(5) == 0x100000005", r == 0x100000005ULL, detail);
@@ -433,7 +464,9 @@ static void t_wide_returns(void)
         stub = dynalib_trampoline_emit(s->fn_ptr, &abi, NULL);
         ok("stub emitted", stub != NULL, "yes");
         if (stub) {
-            int64_t r = ((int64_t (*)(int64_t))stub)(42);
+            uint64_t b[16] = {0}; int64_t r;
+            buf_i(b, 0, 42);
+            r = (int64_t)((dl_stub_i)stub)(b);
             snprintf(detail, sizeof detail, "got %lld", (long long)r);
             ok("stub(42) == -42", r == -42, detail);
             dynalib_trampoline_free(stub, NULL);
@@ -449,9 +482,9 @@ static void t_wide_returns(void)
         stub = dynalib_trampoline_emit(s->fn_ptr, &abi, NULL);
         ok("stub emitted", stub != NULL, "yes");
         if (stub) {
-            uint64_t r = ((uint64_t (*)(uint64_t, uint64_t, uint64_t,
-                                        uint64_t, uint64_t))stub)
-                            (1, 2, 3, 4, 5);
+            uint64_t b[16] = {0}, r; int j;
+            for (j = 0; j < 5; j++) buf_i(b, j, j + 1);
+            r = ((dl_stub_i)stub)(b);
             snprintf(detail, sizeof detail, "got %llu",
                      (unsigned long long)r);
             ok("stub(1..5) == 15", r == 15, detail);
@@ -668,6 +701,144 @@ static void t_sniff(void)
        dynalib_parse_image(lbrct, 16, NULL, 0, NULL, NULL) == -1, "yes");
 }
 
+/* ================================================================== */
+/* T12: floating-point arguments and returns                           */
+/* ================================================================== */
+
+static void t_float_args(void)
+{
+    DynalibModule *m;
+    DynalibSymbol *s;
+    DynalibAbiSpec abi;
+    void *stub;
+    char detail[64];
+    uint64_t b[16];
+    double r;
+
+    printf("T12  floating-point arguments through the call stub\n");
+
+    m = dynalib_open(DBTEST_DLL, DYNALIB_FMT_AUTO, NULL);
+    ok("dbtest.dll loaded", m != NULL, m ? "yes" : "NOT FOUND");
+    if (!m) return;
+
+    /* two doubles: xmm0 and xmm1 */
+    dynalib_abi_parse("f64(f64, f64)", &abi);
+    ok("abi parse f64(f64, f64)",
+       abi.ret_type == DYNALIB_T_F64 && abi.arg_count == 2 &&
+       abi.arg_types[0] == DYNALIB_T_F64, "yes");
+    s = dynalib_resolve(m, 0, "dbtest_fadd", NULL, NULL);
+    ok("dbtest_fadd resolved", s != NULL, "yes");
+    if (s) {
+        stub = dynalib_trampoline_emit(s->fn_ptr, &abi, NULL);
+        ok("stub emitted for f64 args", stub != NULL, "yes");
+        if (stub) {
+            memset(b, 0, sizeof b);
+            buf_d(b, 0, 2.5); buf_d(b, 1, 4.25);
+            r = ((dl_stub_f)stub)(b);
+            snprintf(detail, sizeof detail, "got %f", r);
+            ok("fadd(2.5, 4.25) == 6.75", r == 6.75, detail);
+            dynalib_trampoline_free(stub, NULL);
+        }
+        dynalib_symbol_free(s);
+    }
+
+    /* three doubles: xmm0..xmm2 */
+    dynalib_abi_parse("f64(f64, f64, f64)", &abi);
+    s = dynalib_resolve(m, 0, "dbtest_fmul3", NULL, NULL);
+    ok("dbtest_fmul3 resolved", s != NULL, "yes");
+    if (s) {
+        stub = dynalib_trampoline_emit(s->fn_ptr, &abi, NULL);
+        ok("stub emitted for 3 doubles", stub != NULL, "yes");
+        if (stub) {
+            memset(b, 0, sizeof b);
+            buf_d(b, 0, 2.0); buf_d(b, 1, 3.0); buf_d(b, 2, 4.0);
+            r = ((dl_stub_f)stub)(b);
+            snprintf(detail, sizeof detail, "got %f", r);
+            ok("fmul3(2,3,4) == 24", r == 24.0, detail);
+            dynalib_trampoline_free(stub, NULL);
+        }
+        dynalib_symbol_free(s);
+    }
+
+    /* mixed classes: int, double, int, double, double */
+    dynalib_abi_parse("f64(i32, f64, i32, f64, f64)", &abi);
+    s = dynalib_resolve(m, 0, "dbtest_fmix5", NULL, NULL);
+    ok("dbtest_fmix5 resolved", s != NULL, "yes");
+    if (s) {
+        stub = dynalib_trampoline_emit(s->fn_ptr, &abi, NULL);
+        ok("stub emitted for mixed classes", stub != NULL, "yes");
+        if (stub) {
+            memset(b, 0, sizeof b);
+            buf_i(b, 0, 1); buf_d(b, 1, 2.0); buf_i(b, 2, 3);
+            buf_d(b, 3, 4.0); buf_d(b, 4, 5.0);
+            r = ((dl_stub_f)stub)(b);
+            snprintf(detail, sizeof detail, "got %f (want 1239)", r);
+            ok("fmix5 keeps classes apart", r == 1239.0, detail);
+            dynalib_trampoline_free(stub, NULL);
+        }
+        dynalib_symbol_free(s);
+    }
+
+    /* nine doubles: the ninth spills past the xmm budget onto the stack */
+    dynalib_abi_parse("f64(f64, f64, f64, f64, f64, f64, f64, f64, f64)",
+                      &abi);
+    s = dynalib_resolve(m, 0, "dbtest_fsum9", NULL, NULL);
+    ok("dbtest_fsum9 resolved", s != NULL, "yes");
+    if (s) {
+        stub = dynalib_trampoline_emit(s->fn_ptr, &abi, NULL);
+        ok("stub emitted for 9 doubles", stub != NULL, "yes");
+        if (stub) {
+            int j;
+            memset(b, 0, sizeof b);
+            for (j = 0; j < 9; j++) buf_d(b, j, (double)(j + 1));
+            r = ((dl_stub_f)stub)(b);
+            snprintf(detail, sizeof detail, "got %f (want 45)", r);
+            ok("fsum9(1..9) == 45", r == 45.0, detail);
+            dynalib_trampoline_free(stub, NULL);
+        }
+        dynalib_symbol_free(s);
+    }
+
+    /* a float return has to be widened for a double-reading caller */
+    dynalib_abi_parse("f32(f32)", &abi);
+    s = dynalib_resolve(m, 0, "dbtest_fhalf", NULL, NULL);
+    ok("dbtest_fhalf resolved", s != NULL, "yes");
+    if (s) {
+        stub = dynalib_trampoline_emit(s->fn_ptr, &abi, NULL);
+        ok("stub emitted for f32", stub != NULL, "yes");
+        if (stub) {
+            memset(b, 0, sizeof b);
+            buf_f(b, 0, 7.0f);
+            r = ((dl_stub_f)stub)(b);
+            snprintf(detail, sizeof detail, "got %f (want 3.5)", r);
+            ok("fhalf(7.0) == 3.5", r == 3.5, detail);
+            dynalib_trampoline_free(stub, NULL);
+        }
+        dynalib_symbol_free(s);
+    }
+
+    /* double first, integer second: the GP budget must not eat the
+     * double, and the double must not eat the integer                  */
+    dynalib_abi_parse("f64(f64, i32)", &abi);
+    s = dynalib_resolve(m, 0, "dbtest_fscale", NULL, NULL);
+    ok("dbtest_fscale resolved", s != NULL, "yes");
+    if (s) {
+        stub = dynalib_trampoline_emit(s->fn_ptr, &abi, NULL);
+        ok("stub emitted for f64+i32", stub != NULL, "yes");
+        if (stub) {
+            memset(b, 0, sizeof b);
+            buf_d(b, 0, 1.5); buf_i(b, 1, 4);
+            r = ((dl_stub_f)stub)(b);
+            snprintf(detail, sizeof detail, "got %f (want 6)", r);
+            ok("fscale(1.5, 4) == 6", r == 6.0, detail);
+            dynalib_trampoline_free(stub, NULL);
+        }
+        dynalib_symbol_free(s);
+    }
+
+    dynalib_close(m);
+}
+
 int main(int argc, char **argv)
 {
     const char *sqlite = SQLITE_DLL;
@@ -690,6 +861,7 @@ int main(int argc, char **argv)
     t_trampolines(dbtest);
     t_stack_args();
     t_wide_returns();
+    t_float_args();
 
     printf("\n== %d passed, %d failed ==\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

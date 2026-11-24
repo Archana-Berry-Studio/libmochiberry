@@ -214,11 +214,24 @@ int dynalib_abi_parse(const char *spec, DynalibAbiSpec *out);
 /* ------------------------------------------------------------------ */
 
 /*
- * Emit a stub that forwards its first `arg_count` register arguments to
- * `target` under `abi` and returns its result. The page is written first,
- * then flipped executable (W^X): the caller never sees a writable+executable
- * mapping, and GC movement cannot invalidate it because the buffer is
- * outside the bump arena.
+ * Emit a stub that reads its arguments from a 16-slot uint64_t buffer and
+ * forwards them to `target` under `abi`:
+ *
+ *   uint64_t stub(const uint64_t args[16]);   -- integer/pointer/void return
+ *   double   stub(const uint64_t args[16]);   -- f32/f64 return
+ *
+ * Float arguments must be bit-cast into their slot by the caller
+ * (memcpy the double/float into the slot); integer arguments are the
+ * raw values. The stub classifies every slot per the convention
+ * (MS64: rcx,rdx,r8,r9 / xmm0..xmm3, positional overflow behind a
+ * 32-byte shadow; SysV: rdi,rsi,rdx,rcx,r8,r9 / xmm0..xmm7, class-
+ * counted overflow) and returns the target's result in rax or xmm0;
+ * an f32 return is widened so the double-reading caller sees the
+ * right bits. Struct-by-value contracts are rejected at parse time.
+ *
+ * The page is written first, then flipped executable (W^X): the caller
+ * never sees a writable+executable mapping, and GC movement cannot
+ * invalidate it because the buffer is outside the bump arena.
  *
  * Returns the callable address, or NULL. `pend` reports the page end
  * so the caller can release it with dynalib_trampoline_free().

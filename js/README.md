@@ -49,11 +49,41 @@ loader falls back to `base + offset` for stripped images.
 
 ## Limits (measured, not guessed)
 
-- **Integer/pointer arguments only.** Floating-point arguments are rejected
-  with an explicit error — the current trampoline emitter shuffles
-  general-purpose registers only, so SSE arguments would be silently wrong.
-- **At most 4 register arguments** (x86-64 SysV/MS64 have 4 GP argument
-  registers); stack arguments are not forwarded.
-- Return values come back as numbers; `i64`/`u64` results lose precision
-  above 2^53.
+- **Stack arguments work.** Calls with 5, 7, 8 and 12 arguments return the
+  right values and keep slot order (`mix7(1..7) == 1234567`); the MS64
+  stack-argument offset was measured on this host (arg 5 sits at
+  `[entry_rsp + 0x28]`, after 32 bytes of shadow space).
+- **64-bit returns arrive as `BigInt`** (`u64` → BigInt, `i64` → BigInt,
+  `void` → `undefined`). `u64`/`i64` *arguments* should be passed as
+  `BigInt`; a JS Number loses precision above 2^53.
+- **Floating-point arguments and returns work.** `f32`/`f64` slots are
+  bit-cast into the argument buffer and routed into xmm registers by the
+  trampoline; mixed contracts (`f64(i32, f64, i32, f64, f64)`) keep the
+  integer and float budgets apart, and an `f32` return is widened for the
+  caller. Verified: `fadd(2.5, 4.25) == 6.75`, `fmix5 == 1239`,
+  `fsum9(1..9) == 45`, `fhalf(7.0) == 3.5`, and `msvcrt!sqrt(2) ==
+  1.4142135623730951` through a real CRT call.
+- **At most 12 arguments** through this bridge (the ABI contract table
+  holds 16, the JS bridge exposes 12).
+- Calling without an `abi_sig` is a *raw* call: the stub forwards zero
+  arguments and hands back the raw 64-bit result as a Number.
 - `opts.pinGc` and `opts.lazy` are accepted but not implemented yet.
+
+## Win32 from JavaScript, zero C wrapper
+
+```js
+const tick = dynalib('C:/Windows/System32/kernel32.dll', 0,
+                     'GetTickCount64', 'u64()');
+tick.call();        // -> 182347031n   (BigInt)
+
+const metrics = dynalib('C:/Windows/System32/user32.dll', 0,
+                        'GetSystemMetrics', 'i32(i32)');
+metrics.call(0);    // -> screen width
+
+const sqrt = dynalib('C:/Windows/System32/msvcrt.dll', 0,
+                     'sqrt', 'f64(f64)');
+sqrt.call(2);       // -> 1.4142135623730951
+```
+
+The library side of this bridge lives in its own repo:
+https://github.com/Archana-Berry-Studio/libmochiberry

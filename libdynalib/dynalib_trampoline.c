@@ -115,6 +115,7 @@ static void enc_mem_store_base(CodeBuf *c, int src, int base, int32_t disp)
 {
     unsigned rex = 0x48;
     if (src >= 8) rex |= 0x04;                 /* REX.R — reg field */
+    if (base >= 8) rex |= 0x01;                /* REX.B — r/m field */
     cb_byte(c, rex);
     cb_byte(c, 0x89);                          /* mov r/m64, r64 */
     /* mod=10 (disp32); r/m=101 -> rbp */
@@ -123,7 +124,7 @@ static void enc_mem_store_base(CodeBuf *c, int src, int base, int32_t disp)
         cb_byte(c, 0x80 | ((src & 7) << 3) | 0x04);
         cb_byte(c, 0x24);                      /* scale=1, index=none, base=rsp */
     } else {
-        cb_byte(c, 0x80 | ((src & 7) << 3) | 0x05);
+        cb_byte(c, 0x80 | ((src & 7) << 3) | (base & 7));
     }
     cb_u32(c, (unsigned)disp);
 }
@@ -139,15 +140,59 @@ static void enc_mem_load_base(CodeBuf *c, int dst, int base, int32_t disp)
 {
     unsigned rex = 0x48;
     if (dst >= 8) rex |= 0x04;                 /* REX.R */
+    if (base >= 8) rex |= 0x01;                /* REX.B */
     cb_byte(c, rex);
     cb_byte(c, 0x8B);                          /* mov r64, r/m64 */
     if (base == X_RSP) {
         cb_byte(c, 0x80 | ((dst & 7) << 3) | 0x04);
         cb_byte(c, 0x24);                      /* scale=1, index=none, base=rsp */
     } else {
-        cb_byte(c, 0x80 | ((dst & 7) << 3) | 0x05);
+        cb_byte(c, 0x80 | ((dst & 7) << 3) | (base & 7));
     }
     cb_u32(c, (unsigned)disp);
+}
+
+/* mov r64, r64 — general register move (REX.W 89 /r) */
+static void enc_mov_rr(CodeBuf *c, int src, int dst)
+{
+    unsigned rex = 0x48;
+    if (src >= 8) rex |= 0x04;                 /* REX.R */
+    if (dst >= 8) rex |= 0x01;                 /* REX.B */
+    cb_byte(c, rex);
+    cb_byte(c, 0x89);
+    cb_byte(c, 0xC0 | ((src & 7) << 3) | (dst & 7));
+}
+
+/* movq xmm, [base+disp32] — SSE2: F3 REX.W 0F 7E /r.
+ *
+ * NOTE: 0F 6E with the F3 prefix is MOVQ xmm,xmm (register source only);
+ * loading from MEMORY is 0F 7E. Using 6E with a memory operand raises
+ * #UD (0xC000001D) — verified on this host, not guessed.
+ *
+ * Loads the low 64 bits of the slot into the xmm register; for double
+ * arguments that is the whole value, for float arguments the low 32 bits
+ * are the float itself (the upper half is irrelevant).                 */
+static void enc_movq_xmm_mem(CodeBuf *c, int xmm, int base, int32_t disp)
+{
+    unsigned rex = 0x48;
+    if (xmm >= 8) rex |= 0x04;                 /* REX.R */
+    if (base >= 8) rex |= 0x01;                /* REX.B */
+    cb_byte(c, 0xF3);
+    cb_byte(c, rex);
+    cb_byte(c, 0x0F);
+    cb_byte(c, 0x7E);
+    cb_byte(c, 0x80 | ((xmm & 7) << 3) | (base & 7));
+    cb_u32(c, (unsigned)disp);
+}
+
+/* cvtss2sd xmm0, xmm0 — widen a single-precision return so the C caller
+ * reading xmm0 as a double sees the right bits (F3 0F 5A C0).            */
+static void enc_cvtss2sd_xmm0(CodeBuf *c)
+{
+    cb_byte(c, 0xF3);
+    cb_byte(c, 0x0F);
+    cb_byte(c, 0x5A);
+    cb_byte(c, 0xC0);
 }
 
 /* mov r64, [rbp+disp32] */
@@ -256,54 +301,106 @@ void dynalib_trampoline_free(void *stub, void *pend)
 }
 
 /* ================================================================== */
-/* call stub: forward N register args + stack args to `target`       */
+/* call stub: shuffle an argument buffer into the callee's ABI        */
 /* ================================================================== */
 
 /*
- * Stack-argument layout (measured on this host, MS64):
+ * The emitted stub has ONE canonical native signature, chosen at emit
+ * time by the *caller* of this function:
  *
- *   at function entry       [rsp]      = return address
- *                           [rsp+0x08] = shadow space (32 bytes)
- *                           [rsp+0x28] = first stack argument (arg 5)
+ *   uint64_t stub(const uint64_t args[16]);   -- integer/pointer returns
+ *   double   stub(const uint64_t args[16]);   -- f32/f64 returns
  *
- * MS64 probe result: &arg5 - return_address_slot = 0x28 exactly.
- * SysV has no shadow space: the first stack argument (arg 7) sits at
- * [rsp+0x08] at entry.
+ * The 16-slot buffer holds every argument as a raw 64-bit pattern;
+ * f32/f64 values are bit-cast into their slot by the caller. Inside the
+ * stub the buffer pointer (rcx on MS64 / rdi on SysV) is parked in r10
+ * (volatile in both conventions, never an argument register), then each
+ * slot is classified and routed:
  *
- * The stub therefore has to:
- *   1. reserve the callee's shadow space (MS64) and the outgoing stack
- *      argument area,
- *   2. copy the incoming stack arguments into the outgoing area,
- *   3. load the register arguments,
- *   4. call the target with a 16-byte aligned stack.
+ *   MS64  : integer slots -> rcx,rdx,r8,r9 (first four integer args),
+ *           SSE slots     -> xmm0..xmm3 (first four slots only, positional),
+ *           slots 4..     -> outgoing stack area at [rsp+0x20+8k] behind
+ *                            a 32-byte shadow space.
+ *   SysV  : integer slots -> rdi,rsi,rdx,rcx,r8,r9 (class-counted, NOT
+ *           positional), SSE slots -> xmm0..xmm7, overflow -> [rsp+8k].
+ *
+ * Integer and SSE ordinals are counted independently, which is what
+ * makes mixed signatures (`int, double, int, double`) land correctly.
+ * Return values pass through in rax / xmm0; an f32 return is widened
+ * with cvtss2sd so a caller reading xmm0 as a double sees the right
+ * bits.
  */
 static void emit_call_stub(CodeBuf *c, const void *target, DynalibAbiKind kind,
                            const DynalibAbiSpec *abi, size_t n)
 {
+    static const int ms_int_regs[4] = { X_RCX, X_RDX, X_R8, X_R9 };
+    static const int sv_int_regs[6] = { X_RDI, X_RSI, X_RDX, X_RCX,
+                                        X_R8, X_R9 };
     uintptr_t frame;
-    size_t k, nreg = 0, kstack = 0;
-    int dst;
-    int32_t in_off, out_off;
+    size_t k, kstack = 0;
+    int int_idx = 0, sse_idx = 0;
+    int32_t out_off;
     int custom = (abi && abi->kind == DYNALIB_ABI_CUSTOM_REG);
+    int reg_for[16], xmm_for[16];
+    int32_t stk_for[16];
+    int stk_next = 0;
 
-    /* how many arguments travel in registers */
-    for (k = 0; k < n; k++) {
-        int inc = slot_reg(kind, k);
-        if (inc < 0) break;
-        nreg++;
+    for (k = 0; k < 16; k++) {
+        reg_for[k] = -1;
+        xmm_for[k] = -1;
+        stk_for[k] = -1;
     }
-    if (custom)
-        nreg = n;               /* custom map: every slot is a register */
 
-    kstack = n - nreg;
+    /* classification pass: decide register / xmm / stack per slot */
+    for (k = 0; k < n; k++) {
+        int t = abi ? abi->arg_types[k] : 0;
+        int is_sse = (t == DYNALIB_T_F32 || t == DYNALIB_T_F64);
 
-    /* frame: saved register args + callee shadow + outgoing stack args */
-    frame = 8 * nreg;
+        if (custom) {
+            /* custom register map: every slot rides a register */
+            if (k < 8) {
+                int mapped = slot_reg(kind, abi->arg_regs[k]);
+                if (mapped >= 0)
+                    reg_for[k] = mapped;
+            }
+            continue;
+        }
+
+        if (kind == DYNALIB_ABI_MS64) {
+            /* MS64 is POSITIONAL: slot k (k<4) always uses slot k's
+             * register — rcx/rdx/r8/r9 for integer, xmm0..xmm3 for
+             * floating-point. An integer argument at slot 1 goes to rdx,
+             * never "the next free integer register". Slots >= 4 travel
+             * on the stack.                                            */
+            if (k < 4) {
+                if (is_sse)
+                    xmm_for[k] = (int)k;
+                else
+                    reg_for[k] = ms_int_regs[k];
+            } else {
+                stk_for[k] = stk_next++;
+            }
+        } else {                              /* SysV: class-counted      */
+            if (is_sse) {
+                if (sse_idx < 8) xmm_for[k] = sse_idx;
+                else stk_for[k] = stk_next++;
+                sse_idx++;
+            } else {
+                if (int_idx < 6) reg_for[k] = sv_int_regs[int_idx];
+                else stk_for[k] = stk_next++;
+                int_idx++;
+            }
+        }
+    }
+    kstack = (size_t)stk_next;
+
+    /* frame: callee shadow (MS64) + outgoing stack arguments */
+    frame = 8 * kstack;
     if (kind == DYNALIB_ABI_MS64)
         frame += 32;                          /* callee shadow space       */
-    frame += 8 * kstack;                     /* outgoing stack arguments  */
     if (frame % 16)
         frame += (16 - (frame % 16));
+    out_off = (kind == DYNALIB_ABI_MS64) ? 0x20 : 0x00;
 
     cb_byte(c, 0x55);                          /* push rbp               */
     /* rbp must be set up, not just pushed: the epilogue rebuilds rsp
@@ -315,48 +412,29 @@ static void emit_call_stub(CodeBuf *c, const void *target, DynalibAbiKind kind,
         cb_u32(c, f32);                       /* sub rsp, frame         */
     }
 
-    /* save the incoming register args, canonical slot order */
-    for (k = 0; k < nreg; k++) {
-        int inc = slot_reg(kind, k);
-        if (inc < 0) break;
-        enc_mem_store(c, inc, (int32_t)-8 * (int)(k + 1));
-    }
+    /* park the argument-buffer pointer: MS64 arg0 arrives in rcx,
+     * SysV arg0 in rdi; r10 is volatile scratch in both conventions   */
+    enc_mov_rr(c, kind == DYNALIB_ABI_MS64 ? X_RCX : X_RDI, X_R10);
 
-    /*
-     * Copy the incoming stack arguments into the outgoing area.
-     *   MS64: source [rbp+0x30 + 8i], destination [rsp + 0x20 + 8i]
-     *   SysV: source [rbp+0x10 + 8i], destination [rsp + 0x00 + 8i]
-     *
-     * The copy runs AFTER `sub rsp, frame`, so rsp already points at the
-     * outgoing frame base (the value it will have at the `call`).
-     */
-    if (kstack) {
-        in_off  = (kind == DYNALIB_ABI_MS64) ? 0x30 : 0x10;
-        out_off = (kind == DYNALIB_ABI_MS64) ? 0x20 : 0x00;
-        for (k = 0; k < kstack; k++) {
-            int32_t src = (int32_t)(in_off + 8 * k);
-            int32_t dst_disp = (int32_t)(out_off + 8 * k);
-            enc_mem_load_base(c, X_R11, X_RBP, src);
-            enc_mem_store_base(c, X_R11, X_RSP, dst_disp);
+    /* route every slot */
+    for (k = 0; k < n; k++) {
+        int32_t disp = (int32_t)(8 * k);
+        if (reg_for[k] >= 0)
+            enc_mem_load_base(c, reg_for[k], X_R10, disp);
+        else if (xmm_for[k] >= 0)
+            enc_movq_xmm_mem(c, xmm_for[k], X_R10, disp);
+        else if (stk_for[k] >= 0) {
+            enc_mem_load_base(c, X_R11, X_R10, disp);
+            enc_mem_store_base(c, X_R11, X_RSP,
+                               out_off + (int32_t)(8 * stk_for[k]));
         }
-    }
-
-    /* load them into the target registers */
-    for (k = 0; k < nreg; k++) {
-        int32_t disp = (int32_t)-8 * (int)(k + 1);
-        if (custom) {
-            int mapped = slot_reg(kind, abi->arg_regs[k]);
-            if (mapped < 0) break;
-            dst = mapped;
-        } else {
-            dst = slot_reg(kind, k);
-            if (dst < 0) break;
-        }
-        enc_mem_load(c, dst, disp);
     }
 
     enc_reg_imm64(c, X_RAX, (uintptr_t)target);  /* mov rax, target      */
     cb_byte(c, 0xFF); cb_byte(c, 0xD0);          /* call rax             */
+
+    if (abi && abi->ret_type == DYNALIB_T_F32)
+        enc_cvtss2sd_xmm0(c);               /* widen a float return      */
 
     /* after `push rbp; mov rbp, rsp`, rbp already points at the saved
      * frame-pointer slot, so rsp must return there exactly: one slot
