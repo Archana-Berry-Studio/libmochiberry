@@ -94,3 +94,9 @@ Honest limits:
 ## License
 
 MIT — see `LICENSE`.
+
+# Mochi Berry
+![Mochi Bewwy](archanaberry/mochiberry.png)
+
+# Mochi Berry Chan (Mascot Chan)
+![mochi chan](archanaberry/mochichan.png)
